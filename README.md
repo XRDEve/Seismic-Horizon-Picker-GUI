@@ -39,7 +39,7 @@ Export the picks to an Excel file for further analysis.
 
 CITATION REQUIREMENT:
 If you use this software in your research or publication, please cite it as follows:
-E. K. Tripoliti, SEISMIC HORIZON PICKER GUI - VERSION 1, 2025
+E. K. Tripoliti, SEISMIC HORIZON PICKER GUI - VERSION 1, 2025, DOI:10.5281/zenodo.15647161
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

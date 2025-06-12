@@ -465,14 +465,34 @@ class WaveformDialog(QDialog):
         self.clear_picks_btn = QPushButton("Clear Manual Picks")
         self.clear_picks_btn.clicked.connect(self.clear_manual_picks)
         controls.addWidget(self.clear_picks_btn)
+        # Restore Show Manual Picks and Export/Reflection Buttons if desired
+        self.show_picks_btn = QPushButton("Show Manual Picks on SBP")
+        self.show_picks_btn.clicked.connect(self.handle_show_manual_picks)
+        controls.addWidget(self.show_picks_btn)
+        self.export_picks_btn = QPushButton("Export Manual Picks (.xlsx)")
+        self.export_picks_btn.clicked.connect(self.handle_export_manual_picks)
+        controls.addWidget(self.export_picks_btn)
+        self.reflection_btn = QPushButton("Reflection Coefficient")
+        self.reflection_btn.clicked.connect(self.handle_reflection_coeff)
+        controls.addWidget(self.reflection_btn)
         layout.addLayout(controls)
         # Matplotlib figure and toolbar for waveform visualization
         self.fig, self.ax = plt.subplots(figsize=(7, 4))
         self.canvas = FigureCanvas(self.fig)
-        self.toolbar = NavigationToolbar(self.canvas, self)  # <------- This over here creates the toolbar
-        layout.addWidget(self.toolbar)  # <-------  Add toolbar first
-        layout.addWidget(self.canvas)  # <-------  Then add the canvas
-        # Plot initial waveform
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.canvas)
+        # --- Connect filter controls and apply logic ---
+        self.filter_combo.currentIndexChanged.connect(self.update_controls_visibility)
+        self.filter_combo.currentIndexChanged.connect(self.apply_filter_and_plot)
+        self.cutoff_spin.valueChanged.connect(self.apply_filter_and_plot)
+        self.hp_cutoff_spin.valueChanged.connect(self.apply_filter_and_plot)
+        self.lp_cutoff_spin.valueChanged.connect(self.apply_filter_and_plot)
+        self.smooth_spin.valueChanged.connect(self.apply_filter_and_plot)
+        self.apply_btn.clicked.connect(self.apply_filter_and_plot)
+        self.update_controls_visibility()
+        # Connect picking
+        self.canvas.mpl_connect('button_press_event', self.on_canvas_click)
         self.plot_waveform(self.filtered_trace, label="Raw Signal", color='gray')
 
     def update_controls_visibility(self):
@@ -491,29 +511,32 @@ class WaveformDialog(QDialog):
         """
         ftype = self.filter_combo.currentText()
         y = self.trace
-        if ftype == "None":
-            self.filtered_trace = y.copy()
-            self.plot_waveform(self.filtered_trace, label="Raw Signal", color='gray')
-        elif ftype == "Low-pass":
-            cutoff = self.cutoff_spin.value() * 1000
-            self.filtered_trace = butter_filter(y, self.fs, 'low', cutoff)
-            self.plot_waveform(self.filtered_trace, label=f"Low-pass {self.cutoff_spin.value():.2f}kHz", color='b')
-        elif ftype == "High-pass":
-            cutoff = self.cutoff_spin.value() * 1000
-            self.filtered_trace = butter_filter(y, self.fs, 'high', cutoff)
-            self.plot_waveform(self.filtered_trace, label=f"High-pass {self.cutoff_spin.value():.2f}kHz", color='g')
-        elif ftype == "Band-pass":
-            hp = self.hp_cutoff_spin.value() * 1000
-            lp = self.lp_cutoff_spin.value() * 1000
-            if hp >= lp:
-                QMessageBox.warning(self, "Invalid band", "High cutoff must be lower than low cutoff")
-                return
-            self.filtered_trace = butter_filter(y, self.fs, 'band', band=[hp, lp])
-            self.plot_waveform(self.filtered_trace, label=f"Band {self.hp_cutoff_spin.value():.2f}-{self.lp_cutoff_spin.value():.2f}kHz", color='m')
-        elif ftype == "Smoothing":
-            window = self.smooth_spin.value()
-            self.filtered_trace = np.convolve(y, np.ones(window)/window, mode='same')
-            self.plot_waveform(self.filtered_trace, label=f"Smoothing {window}", color='r')
+        try:
+            if ftype == "None":
+                self.filtered_trace = y.copy()
+                self.plot_waveform(self.filtered_trace, label="Raw Signal", color='gray')
+            elif ftype == "Low-pass":
+                cutoff = self.cutoff_spin.value() * 1000
+                self.filtered_trace = butter_filter(y, self.fs, 'low', cutoff)
+                self.plot_waveform(self.filtered_trace, label=f"Low-pass {self.cutoff_spin.value():.2f}kHz", color='b')
+            elif ftype == "High-pass":
+                cutoff = self.cutoff_spin.value() * 1000
+                self.filtered_trace = butter_filter(y, self.fs, 'high', cutoff)
+                self.plot_waveform(self.filtered_trace, label=f"High-pass {self.cutoff_spin.value():.2f}kHz", color='g')
+            elif ftype == "Band-pass":
+                hp = self.hp_cutoff_spin.value() * 1000
+                lp = self.lp_cutoff_spin.value() * 1000
+                if hp >= lp:
+                    QMessageBox.warning(self, "Invalid band", "High cutoff must be lower than low cutoff")
+                    return
+                self.filtered_trace = butter_filter(y, self.fs, 'band', band=[hp, lp])
+                self.plot_waveform(self.filtered_trace, label=f"Band {self.hp_cutoff_spin.value():.2f}-{self.lp_cutoff_spin.value():.2f}kHz", color='m')
+            elif ftype == "Smoothing":
+                window = self.smooth_spin.value()
+                self.filtered_trace = np.convolve(y, np.ones(window)/window, mode='same')
+                self.plot_waveform(self.filtered_trace, label=f"Smoothing {window}", color='r')
+        except Exception as e:
+            QMessageBox.critical(self, "Filter Error", f"Error applying filter: {e}")
 
     def plot_waveform(self, y, label="Raw Signal", color='gray'):
         """
@@ -533,7 +556,10 @@ class WaveformDialog(QDialog):
         self.ax.set_xlabel("Depth (m)")
         self.ax.set_ylabel("Amplitude")
         self.ax.set_title(f"Waveform at Selected Trace {self.trace_idx}")
-        self.ax.legend()
+        handles, labels = self.ax.get_legend_handles_labels()
+        uniq = list(dict(zip(labels, handles)).items())
+        if uniq:
+            self.ax.legend([h for l, h in uniq], [l for l, h in uniq])
         if self.xlim is not None:
             self.ax.set_xlim(self.xlim)
         self.fig.tight_layout()
@@ -556,8 +582,8 @@ class WaveformDialog(QDialog):
         if idx not in self.manual_picks:
             self.manual_picks.append(idx)
             self.plot_waveform(self.filtered_trace,
-                               label="Raw Signal" if np.array_equal(self.filtered_trace, self.trace) else "Filtered Signal",
-                               color='grey' if np.array_equal(self.filtered_trace, self.trace) else 'b')
+                               label=self.filter_combo.currentText() if self.filter_combo.currentText() != "None" else "Raw Signal",
+                               color={'None':'gray','Low-pass':'b','High-pass':'g','Band-pass':'m','Smoothing':'r'}.get(self.filter_combo.currentText(), 'gray'))
             self.manual_picks_dict[self.trace_idx] = list(self.manual_picks)
 
     def clear_manual_picks(self):
@@ -566,8 +592,8 @@ class WaveformDialog(QDialog):
         """
         self.manual_picks = []
         self.plot_waveform(self.filtered_trace,
-                           label="Raw Signal" if np.array_equal(self.filtered_trace, self.trace) else "Filtered Signal",
-                           color='grey' if np.array_equal(self.filtered_trace, self.trace) else 'b')
+                           label=self.filter_combo.currentText() if self.filter_combo.currentText() != "None" else "Raw Signal",
+                           color={'None':'gray','Low-pass':'b','High-pass':'g','Band-pass':'m','Smoothing':'r'}.get(self.filter_combo.currentText(), 'gray'))
         if self.trace_idx in self.manual_picks_dict:
             del self.manual_picks_dict[self.trace_idx]
 
@@ -579,7 +605,6 @@ class WaveformDialog(QDialog):
         if fname:
             self.fig.savefig(fname, dpi=900, bbox_inches='tight')
 
-    # --- Export manual picks for Selected trace only ---
     def handle_export_manual_picks(self):
         """
         Export manual picks for this trace to an Excel file.
@@ -598,7 +623,6 @@ class WaveformDialog(QDialog):
         df.to_excel(fname, index=False)
         QMessageBox.information(self, "Export Complete", f"Manual picks exported to {fname}")
 
-    # --- Show manual picks in SBP section (call parent main window) ---
     def handle_show_manual_picks(self):
         """
         Request the main window to plot manual picks for all traces.
@@ -606,7 +630,6 @@ class WaveformDialog(QDialog):
         if self.parent() is not None and hasattr(self.parent(), "plot_manual_picks_on_section"):
             self.parent().plot_manual_picks_on_section()
 
-    # --- Reflection coeff (for this trace) ---
     def handle_reflection_coeff(self):
         """
         Show the Reflection Coefficient dialog for current manual picks.
@@ -617,7 +640,6 @@ class WaveformDialog(QDialog):
         picks = self.manual_picks_dict[self.trace_idx]
         dlg = ReflectionCoeffDialog(self.trace, self.sample_depths, picks, parent=self)
         dlg.exec_()
-
 # --------------------------- MAIN GUI APPLICATION ---------------------------
 class ModernHorizonPickerGUI(QMainWindow):
     """

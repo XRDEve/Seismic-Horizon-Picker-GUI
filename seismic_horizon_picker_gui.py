@@ -1222,8 +1222,18 @@ class ModernHorizonPickerGUI(QMainWindow):
         if self.seismic_data is None or self.sample_depths is None:
             QMessageBox.warning(self, "No Data", "Please load a SEG-Y file first.")
             return
-        # Show waveform at the middle trace as a demo, or enhance to let the user pick
-        trace_idx = self.seismic_data.shape[0] // 2
+        num_traces = self.seismic_data.shape[0]
+        # Prompt the user to select the trace index within valid range
+        trace_idx, ok = QInputDialog.getInt(
+            self,
+            "Select Trace",
+            f"Select trace index (0 - {num_traces - 1}):",
+            value=0,
+            min=0,
+            max=num_traces - 1
+        )
+        if not ok:
+            return
         trace = self.seismic_data[trace_idx]
         max_sample_index = self.seismic_data.shape[1] - 1
         dlg = WaveformDialog(
@@ -1235,6 +1245,7 @@ class ModernHorizonPickerGUI(QMainWindow):
             max_sample_index=max_sample_index
         )
         dlg.exec_()
+
     def show_dip_azimuth_dialog(self):
         if not (self.horizons and self.local_orientations):
             QMessageBox.information(self, "No Data", "No horizon data to show.")

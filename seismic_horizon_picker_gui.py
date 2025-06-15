@@ -1051,7 +1051,7 @@ class ModernHorizonPickerGUI(QMainWindow):
         self.btn_show_dip_az.clicked.connect(self.show_dip_azimuth_dialog)
         controls_layout.addWidget(self.btn_show_dip_az)
         self.btn_waveform = QPushButton("Show Waveform")
-        self.btn_waveform.clicked.connect(self.show_waveform_dialog)  # <-- add this line
+        self.btn_waveform.clicked.connect(self.show_waveform_dialog)  
         controls_layout.addWidget(self.btn_waveform)
         self.btn_export_auto_xlsx = QPushButton("Export Automatic Picks to .xlsx")
         self.btn_export_auto_xlsx.clicked.connect(self.export_automatic_picks_to_xlsx)
@@ -1264,7 +1264,7 @@ class ModernHorizonPickerGUI(QMainWindow):
         QMessageBox.information(self, "Export Complete", f"Automatic picks exported to {fname}")
 
     def on_seed_click(self, event):
-        pass  # (implement as needed or leave as no-op)
+        pass  
 
 # ---------------------------- MAIN ENTRY POINT ------------------------------
 def main():

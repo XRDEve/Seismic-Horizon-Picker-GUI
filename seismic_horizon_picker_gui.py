@@ -298,21 +298,11 @@ class HorizonWorker(QThread):
             cos_phase = np.cos(phase)
             n_horizons = self.params['max_horizons']
 
-            # -----Horizon Picking Parameters-----
             min_horizon_spacing = 20
-            # Minimum vertical distance (in samples) to mask above/below a picked horizon.
-            # Prevents picking another horizon too close, so that horizons can't be adjacent or overlapping vertically.
-
             trace_mask_width = 2
-            # Number of traces to mask on either side (left/right) of a pick.
-            # Horizontally extends the mask to avoid picking features that are too close in neighboring traces.
-
             min_continuity = 5
-            # Minimum number of continuous (unbroken) picks required for a picked horizon to be accepted/kept.
-            # Filters out short/noisy picks that don't span enough traces.
 
             env_work = envelope_smoothed.copy()
-
             forbidden_indices = [set() for _ in range(num_traces)]
             horizons = []
 
@@ -320,6 +310,19 @@ class HorizonWorker(QThread):
                 for t in range(num_traces):
                     for s_forbid in forbidden_indices[t]:
                         env_work[t, s_forbid] = 0
+
+                # --------- STRICT ORDERING BLOCK -----------
+                # Find the deepest pick of all previous horizons at each trace
+                min_allowed = [0] * num_traces
+                for t in range(num_traces):
+                    # Find the maximum pick among all previous horizons at this trace
+                    prev_picks = [h[t] for h in horizons if t < len(h) and h[t] is not None]
+                    if prev_picks:
+                        min_allowed[t] = max(prev_picks) + 1  # strictly below all previous
+                    else:
+                        min_allowed[t] = 0
+                    env_work[t, :min_allowed[t]] = 0
+                # -------------------------------------------
 
                 if np.all(env_work == 0):
                     break
@@ -335,25 +338,25 @@ class HorizonWorker(QThread):
                     seed_trace,
                     seed_sample,
                     forbidden_indices=forbidden_indices,
-                    window=15,      # Max offset (in samples) above/below previous pick to search for next pick.
-                                    # Controls vertical search window width and smoothness of horizon.
-                    max_dip=15,     # Maximum allowed jump (in samples) between neighboring picks.
-                                    # Limits the steepness/slope of the picked horizon and prevents wild jumps.
-                    min_snr=1.0,    # Minimum required signal-to-noise ratio for a valid pick.
-                                    # Picks must be at least this much stronger than the local noise/background.
-                    min_length=5    # Minimum length (in traces) for a continuous segment to be considered valid.
-                                    # Shorter segments are ignored as noise.
+                    window=15,
+                    max_dip=15,
+                    min_snr=1.0,
+                    min_length=5
                 )
-                # Accept only picks that are not forbidden
+
                 picks = []
                 for t, s in raw_picks:
                     if (
-                        s is not None and
-                        0 <= t < num_traces and
-                        0 <= s < num_samples and
-                        env_work[t, s] > 0 and
-                        s not in forbidden_indices[t]
+                            s is not None and
+                            0 <= t < num_traces and
+                            0 <= s < num_samples and
+                            env_work[t, s] > 0 and
+                            s not in forbidden_indices[t]
                     ):
+                        # Enforce again: only allow strictly below all previous
+                        prev_picks = [h[t] for h in horizons if t < len(h) and h[t] is not None]
+                        if prev_picks and s <= max(prev_picks):
+                            continue
                         picks.append((t, s))
 
                 if len(picks) < min_continuity:
@@ -373,6 +376,7 @@ class HorizonWorker(QThread):
                     horizon_picks[t] = s
                     if s is not None:
                         forbidden_indices[t].add(s)
+
                 horizons.append(horizon_picks)
 
                 # Mask above/below and laterally for next horizon
@@ -395,7 +399,6 @@ class HorizonWorker(QThread):
                         else:
                             used[t].add(s)
 
-            # Show all found horizons found
             main_horizons = horizons
 
             orientations = []
@@ -420,7 +423,6 @@ class HorizonWorker(QThread):
             })
         except Exception as e:
             self.error.emit(str(e))
-
 
 class CosinePhaseHorizonsDialog(QDialog):
     def __init__(self, phase, auto_picks, manual_picks_dict=None, parent=None):

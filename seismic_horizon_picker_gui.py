@@ -26,8 +26,6 @@ from PyQt5.QtWidgets import (
     QInputDialog, QDialog, QComboBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from sklearn.cluster import DBSCAN
-from collections import defaultdict
 import multiprocessing
 import pandas as pd
 from scipy.signal import find_peaks
@@ -45,6 +43,38 @@ def envelope_to_grayscale(envelope):
     G = (envelope - Boundlow) / (Boundup - Boundlow) * 255
     G = np.clip(G, 0, 255)
     return G.astype(np.uint8)
+
+def find_most_continuous_seed(env_work, mask=None, method="sum"):
+    """
+    Find (trace, sample) index for the most continuous strong reflector.
+    Picks the sample (depth) that is strong across many traces.
+    - method: "sum" or "median" for how to aggregate along traces.
+    - mask: (optional) bool array, same shape as env_work, True=ignore.
+    Returns: (seed_trace, seed_sample)
+    """
+    if mask is not None:
+        env = np.where(mask, 0, env_work)
+    else:
+        env = env_work.copy()
+
+    if np.all(env == 0):
+        return None  # explicitly fail if everything is masked
+
+    # Aggregate along traces
+    if method == "sum":
+        trace_strength = np.sum(env, axis=0)  # shape: [num_samples]
+    elif method == "median":
+        trace_strength = np.median(env, axis=0)
+    else:
+        raise ValueError("method must be 'sum' or 'median'")
+    best_sample = int(np.argmax(trace_strength))
+    if np.all(env[:, best_sample] == 0):
+        # There is no nonzero value at this sample, just pick the global max in env
+        idx = np.argmax(env)
+        seed_trace, seed_sample = np.unravel_index(idx, env.shape)
+        return int(seed_trace), int(seed_sample)
+    best_trace = int(np.argmax(env[:, best_sample]))
+    return best_trace, best_sample
 
 def twt_to_depth(twt_array, velocity=1500.0):
     """
@@ -166,16 +196,17 @@ def extract_all_segments(pick_matrix, min_length=20):
     if len(current) >= min_length:
         segments.append(current)
     return segments
+
 def track_horizon_advanced(
     envelope,
     cos_phase,
     seed_trace,
     seed_sample,
     forbidden_indices=None,
-    window=10,  # Number of samples above/below previous pick to search for the next pick (vertical search window)
-    max_dip=8,  # Maximum allowed jump (in samples) between consecutive picks (limits horizon steepness)
-    min_snr=2.0,  # Minimum signal-to-noise ratio required for a valid pick (peak must be at least 2x local noise)
-    min_length=10,  # Minimum number of continuous picks (traces) for a segment to be accepted as a valid horizon
+    window=60,  # Number of samples above/below previous pick to search for the next pick (vertical search window)
+    max_dip=30,  # Maximum allowed jump (in samples) between consecutive picks (limits horizon steepness)
+    min_snr=1.0,  # Minimum signal-to-noise ratio required for a valid pick (peak must be at least 2x local noise)
+    min_length=60,  # Minimum number of continuous picks (traces) for a segment to be accepted as a valid horizon
 ):
     """
     Overlap-safe horizon tracker: forbidden_indices is checked for every possible pick.
@@ -273,6 +304,86 @@ def track_horizon_advanced(
         return []
     return [(t, int(picks[t])) for t in longest]
 
+def track_horizon_local_maxima(
+    envelope,
+    seed_trace,
+    seed_sample,
+    window=60,
+    max_dip=40,
+    min_dist=30,
+    min_height=None,
+    min_length=60
+):
+    """
+    Track a horizon by following local maxima (not just global max) for greater continuity.
+    """
+    num_traces, num_samples = envelope.shape
+    picks = [None] * num_traces
+    picks[seed_trace] = seed_sample
+    prev_sample = seed_sample
+
+    # Forward
+    for t in range(seed_trace + 1, num_traces):
+        search_min = max(0, prev_sample - window)
+        search_max = min(num_samples, prev_sample + window + 1)
+        segment_env = envelope[t, search_min:search_max]
+        if segment_env.size == 0:
+            continue
+        # Find all local maxima in window
+        peaks = get_local_maxima(segment_env, min_dist=min_dist, min_height=min_height)
+        if len(peaks) == 0:
+            continue
+        # Pick the local maxima closest to previous pick (in depth)
+        best_peak = peaks[np.argmin(np.abs(peaks + search_min - prev_sample))]
+        pick = search_min + best_peak
+        if abs(pick - prev_sample) > max_dip:
+            continue
+        picks[t] = pick
+        prev_sample = pick
+
+    # Backward
+    prev_sample = seed_sample
+    for t in range(seed_trace - 1, -1, -1):
+        search_min = max(0, prev_sample - window)
+        search_max = min(num_samples, prev_sample + window + 1)
+        segment_env = envelope[t, search_min:search_max]
+        if segment_env.size == 0:
+            continue
+        peaks = get_local_maxima(segment_env, min_dist=min_dist, min_height=min_height)
+        if len(peaks) == 0:
+            continue
+        best_peak = peaks[np.argmin(np.abs(peaks + search_min - prev_sample))]
+        pick = search_min + best_peak
+        if abs(pick - prev_sample) > max_dip:
+            continue
+        picks[t] = pick
+        prev_sample = pick
+
+    # Only keep large enough continuous segments
+    indices = [i for i, p in enumerate(picks) if p is not None]
+    if not indices:
+        return []
+    segments = []
+    current = []
+    for idx in indices:
+        if not current or idx == current[-1] + 1:
+            current.append(idx)
+        else:
+            segments.append(current)
+            current = [idx]
+    if current:
+        segments.append(current)
+    longest = max(segments, key=len)
+    if len(longest) < min_length:
+        return []
+    return [(t, int(picks[t])) for t in longest]
+
+def get_local_maxima(signal, min_dist=30, min_height=None):
+    """
+    Find indices of local maxima in a 1D signal.
+    """
+    peaks, _ = find_peaks(signal, distance=min_dist, height=min_height)
+    return peaks
 # ------------------- WORKER THREAD FOR HORIZON PICKING ----------------------
 class HorizonWorker(QThread):
     progress = pyqtSignal(int)
@@ -293,14 +404,19 @@ class HorizonWorker(QThread):
             phase = np.angle(analytic_signal)
             self.progress.emit(15)
             envelope_smoothed = gaussian_filter(envelope, sigma=self.params['sigma'])
+
+            env_thresh_ratio = self.params.get('env_thresh_ratio', 0.0)  # let's assume 0 as default i.e., no masking
+            threshold_value = np.percentile(envelope_smoothed, 100 * env_thresh_ratio)
+            envelope_smoothed[envelope_smoothed < threshold_value] = 0
+
             self.progress.emit(25)
             num_traces, num_samples = envelope_smoothed.shape
             cos_phase = np.cos(phase)
             n_horizons = self.params['max_horizons']
 
-            min_horizon_spacing = 20
-            trace_mask_width = 2
-            min_continuity = 5
+            min_horizon_spacing = self.params['min_dist']
+            trace_mask_width = 3
+            min_continuity = 30
 
             env_work = envelope_smoothed.copy()
             forbidden_indices = [set() for _ in range(num_traces)]
@@ -327,21 +443,21 @@ class HorizonWorker(QThread):
                 if np.all(env_work == 0):
                     break
 
-                seed_trace, seed_sample = np.unravel_index(np.argmax(env_work), env_work.shape)
-                if env_work[seed_trace, seed_sample] == 0:
+                seed = find_most_continuous_seed(env_work, method="sum")
+                if seed is None or env_work[seed[0], seed[1]] == 0:
                     break
+                seed_trace, seed_sample = seed
 
                 # -----Tracking Parameters-----
-                raw_picks = track_horizon_advanced(
+                raw_picks = track_horizon_local_maxima(
                     env_work,
-                    cos_phase,
                     seed_trace,
                     seed_sample,
-                    forbidden_indices=forbidden_indices,
-                    window=15,
-                    max_dip=15,
-                    min_snr=1.0,
-                    min_length=5
+                    window=60,
+                    max_dip=40,
+                    min_dist=self.params.get('min_dist', 30),
+                    min_height=np.percentile(env_work, 100 * self.params.get('env_thresh_ratio', 0.0)),
+                    min_length=60
                 )
 
                 picks = []
@@ -361,7 +477,6 @@ class HorizonWorker(QThread):
 
                 if len(picks) < min_continuity:
                     break
-
                 pick_samples = [s for t, s in picks]
                 if len(pick_samples) == 0 or np.std(pick_samples) < 2:
                     continue
@@ -370,15 +485,12 @@ class HorizonWorker(QThread):
                 env_along_horizon = [env_work[t, s] for t, s in picks]
                 if np.mean(env_along_horizon) < np.percentile(envelope_smoothed, 50):
                     continue
-
                 horizon_picks = [None] * num_traces
                 for t, s in picks:
                     horizon_picks[t] = s
                     if s is not None:
                         forbidden_indices[t].add(s)
-
                 horizons.append(horizon_picks)
-
                 # Mask above/below and laterally for next horizon
                 for t, s in picks:
                     if s is not None:
@@ -386,7 +498,6 @@ class HorizonWorker(QThread):
                             lo = max(0, s - min_horizon_spacing)
                             hi = min(num_samples, s + min_horizon_spacing + 1)
                             env_work[tt, lo:hi] = 0
-
                 self.progress.emit(int(25 + 25 * (horizon_idx + 1) / n_horizons))
 
             # Deduplicate: only first horizon per trace/sample
@@ -398,9 +509,7 @@ class HorizonWorker(QThread):
                             h[t] = None
                         else:
                             used[t].add(s)
-
             main_horizons = horizons
-
             orientations = []
             for horizon in main_horizons:
                 trace_indices = [i for i, s in enumerate(horizon) if s is not None]
@@ -413,7 +522,6 @@ class HorizonWorker(QThread):
                     window_size=self.params.get('orientation_window', 7),
                     min_points=3, interp_gaps=True)
                 orientations.append({'trace_indices': tr, 'sample_indices': sm, 'dip': dip, 'azimuth': azimuth})
-
             self.progress.emit(100)
             self.finished.emit({
                 'horizons': main_horizons,
@@ -442,7 +550,7 @@ class CosinePhaseHorizonsDialog(QDialog):
         # Overlay auto picks (all traces)
         if auto_picks:
             pick_i, pick_j = zip(*auto_picks)
-            ax.plot(pick_i, pick_j, 'rx', label="Auto Pick", markersize=3, alpha=0.9)
+            ax.plot(pick_i, pick_j, 'o', label="Auto Pick", markersize=3, alpha=0.9)
         # Overlay manual picks (all traces) -- CYAN CIRCLES
         if manual_picks_dict:
             manual_trace_idxs = []
@@ -452,10 +560,10 @@ class CosinePhaseHorizonsDialog(QDialog):
                     manual_trace_idxs.append(trc_idx)
                     manual_sample_idxs.append(sample_idx)
             if manual_trace_idxs:
-                ax.plot(manual_trace_idxs, manual_sample_idxs, 'o', color='c', markersize=5, alpha=0.8, label="Manual Pick")
+                ax.plot(manual_trace_idxs, manual_sample_idxs, 'o', color='c', markersize=5, alpha=1, markerfacecolor='k', label="Manual Pick")
         ax.set_xlabel("Trace Index")
-        ax.set_ylabel("Sample Index (TWT)")
-        ax.set_title("Cosine Phase Image with All Horizons")
+        ax.set_ylabel("Sample Index (T-WT-)")
+        ax.set_title("Cosine Phase Image with Manually Picked Horizons")
         ax.legend()
         fig.tight_layout()
         canvas.draw()
@@ -564,78 +672,78 @@ class DipAzimuthDialog(QDialog):
         if fname:
             self.fig2.savefig(fname, dpi=900, bbox_inches='tight')
 
-class ReflectionCoeffDialog(QDialog):
-    """
-    Displaying and exporting reflection coefficients
-    for manual picks on a selected seismic trace.
-    """
-    def __init__(self, trace, sample_depths, picks, velocity=1500.0, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Reflection Coefficient Analysis")
-        self.resize(600, 400)
-        layout = QVBoxLayout(self)
-        self.trace = trace
-        self.sample_depths = sample_depths
-        self.picks = picks
-        self.velocity = velocity
-
-        # Convert TWT (ms) to depth (m) for pick locations
-        depths = twt_to_depth(sample_depths, velocity)
-        pick_depths = [depths[idx] for idx in picks]
-
-        # Reference pick selection for normalization
-        ref_layout = QHBoxLayout()
-        ref_layout.addWidget(QLabel("Reference Pick:"))
-        self.ref_combo = QComboBox()
-        for i, d in enumerate(pick_depths):
-            self.ref_combo.addItem(f"{i}: {d:.2f} m")
-        ref_layout.addWidget(self.ref_combo)
-        layout.addLayout(ref_layout)
-
-        # Main plot setup
-        self.fig, self.ax = plt.subplots(figsize=(7, 4))
-        self.canvas = FigureCanvas(self.fig)
-        self.toolbar = NavigationToolbar(self.canvas, self)
-        layout.addWidget(self.toolbar)  # Toolbar goes here
-        layout.addWidget(self.canvas)  # Then the canvas
-
-        self.ref_combo.currentIndexChanged.connect(self.replot)
-        self.replot()
-
-    def compute_reflection_coefficients(self, trace, picks, window_samples=20, reference_idx=0):
-        """
-        Compute normalized reflection coefficients for each pick, relative to
-        the amplitude at the reference pick.
-        """
-        coeffs = []
-        ref_pick = picks[reference_idx]
-        ref_amp = np.max(np.abs(trace[max(0, ref_pick-window_samples//2):ref_pick+window_samples//2+1]))
-        for idx in picks:
-            win_lo = max(0, idx - window_samples//2)
-            win_hi = min(len(trace), idx + window_samples//2 + 1)
-            amp = np.max(np.abs(trace[win_lo:win_hi]))
-            coeffs.append(amp / ref_amp if ref_amp != 0 else 0)
-        return coeffs
-
-    def replot(self):
-        """
-        Draw (or re-draw) the reflection coefficient plot.
-        """
-        window_samples = 20
-        reference_idx = self.ref_combo.currentIndex()
-        coeffs = self.compute_reflection_coefficients(self.trace, self.picks, window_samples, reference_idx)
-        depths = twt_to_depth(self.sample_depths, self.velocity)
-        pick_depths = [depths[idx] for idx in self.picks]
-        self.ax.clear()
-        self.ax.plot(coeffs, pick_depths, 'o-', label="Reflection Coefficient")
-        self.ax.invert_yaxis()
-        self.ax.set_xlabel("Normalized Reflection Coefficient")
-        self.ax.set_ylabel("Depth (m)")
-        self.ax.set_title("Reflection Coefficient vs Depth")
-        self.ax.grid()
-        self.ax.legend()
-        self.fig.tight_layout()
-        self.canvas.draw()
+# class ReflectionCoeffDialog(QDialog):
+#     """
+#     Displaying and exporting reflection coefficients
+#     for manual picks on a selected seismic trace.
+#     """
+#     def __init__(self, trace, sample_depths, picks, velocity=1500.0, parent=None):
+#         super().__init__(parent)
+#         self.setWindowTitle("Reflection Coefficient Analysis")
+#         self.resize(600, 400)
+#         layout = QVBoxLayout(self)
+#         self.trace = trace
+#         self.sample_depths = sample_depths
+#         self.picks = picks
+#         self.velocity = velocity
+#
+#         # Convert TWT (ms) to depth (m) for pick locations
+#         depths = twt_to_depth(sample_depths, velocity)
+#         pick_depths = [depths[idx] for idx in picks]
+#
+#         # Reference pick selection for normalization
+#         ref_layout = QHBoxLayout()
+#         ref_layout.addWidget(QLabel("Reference Pick:"))
+#         self.ref_combo = QComboBox()
+#         for i, d in enumerate(pick_depths):
+#             self.ref_combo.addItem(f"{i}: {d:.2f} m")
+#         ref_layout.addWidget(self.ref_combo)
+#         layout.addLayout(ref_layout)
+#
+#         # Main plot setup
+#         self.fig, self.ax = plt.subplots(figsize=(7, 4))
+#         self.canvas = FigureCanvas(self.fig)
+#         self.toolbar = NavigationToolbar(self.canvas, self)
+#         layout.addWidget(self.toolbar)  # Toolbar goes here
+#         layout.addWidget(self.canvas)  # Then the canvas
+#
+#         self.ref_combo.currentIndexChanged.connect(self.replot)
+#         self.replot()
+#
+#     def compute_reflection_coefficients(self, trace, picks, window_samples=20, reference_idx=0):
+#         """
+#         Compute normalized reflection coefficients for each pick, relative to
+#         the amplitude at the reference pick.
+#         """
+#         coeffs = []
+#         ref_pick = picks[reference_idx]
+#         ref_amp = np.max(np.abs(trace[max(0, ref_pick-window_samples//2):ref_pick+window_samples//2+1]))
+#         for idx in picks:
+#             win_lo = max(0, idx - window_samples//2)
+#             win_hi = min(len(trace), idx + window_samples//2 + 1)
+#             amp = np.max(np.abs(trace[win_lo:win_hi]))
+#             coeffs.append(amp / ref_amp if ref_amp != 0 else 0)
+#         return coeffs
+#
+#     def replot(self):
+#         """
+#         Draw (or re-draw) the reflection coefficient plot.
+#         """
+#         window_samples = 20
+#         reference_idx = self.ref_combo.currentIndex()
+#         coeffs = self.compute_reflection_coefficients(self.trace, self.picks, window_samples, reference_idx)
+#         depths = twt_to_depth(self.sample_depths, self.velocity)
+#         pick_depths = [depths[idx] for idx in self.picks]
+#         self.ax.clear()
+#         self.ax.plot(coeffs, pick_depths, 'o-', label="Reflection Coefficient")
+#         self.ax.invert_yaxis()
+#         self.ax.set_xlabel("Normalized Reflection Coefficient")
+#         self.ax.set_ylabel("Depth (m)")
+#         self.ax.set_title("Reflection Coefficient vs Depth")
+#         self.ax.grid()
+#         self.ax.legend()
+#         self.fig.tight_layout()
+#         self.canvas.draw()
 
 class TracePicksDialog(QDialog):
     def __init__(self, trace_idx, phase, manual_picks, auto_picks, sample_depths, parent=None):
@@ -757,9 +865,9 @@ class WaveformDialog(QDialog):
         self.export_picks_btn = QPushButton("Export Manual Picks (.xlsx)")
         self.export_picks_btn.clicked.connect(self.handle_export_manual_picks)
         controls.addWidget(self.export_picks_btn)
-        self.reflection_btn = QPushButton("Reflection Coefficient")
-        self.reflection_btn.clicked.connect(self.handle_reflection_coeff)
-        controls.addWidget(self.reflection_btn)
+        # self.reflection_btn = QPushButton("Reflection Coefficient")
+        # self.reflection_btn.clicked.connect(self.handle_reflection_coeff)
+        # controls.addWidget(self.reflection_btn)
         layout.addLayout(controls)
         # Matplotlib figure and toolbar for waveform visualization
         self.fig, self.ax = plt.subplots(figsize=(7, 4))
@@ -896,19 +1004,8 @@ class WaveformDialog(QDialog):
             self.manual_picks.append(idx)
             self.plot_waveform(self.filtered_trace,
                                label=self.filter_combo.currentText() if self.filter_combo.currentText() != "None" else "Raw Signal",
-                               color={'None':'gray','Low-pass':'b','High-pass':'g','Band-pass':'m','Smoothing':'r'}.get(self.filter_combo.currentText(), 'gray'))
+                               color={'None':'gray','Low-pass':'b','High-pass':'b','Band-pass':'b','Smoothing':'b'}.get(self.filter_combo.currentText(), 'gray'))
             self.manual_picks_dict[self.trace_idx] = list(self.manual_picks)
-
-    def clear_manual_picks(self):
-        """
-        Clear all manual picks for this trace and update the plot.
-        """
-        self.manual_picks = []
-        self.plot_waveform(self.filtered_trace,
-                           label=self.filter_combo.currentText() if self.filter_combo.currentText() != "None" else "Raw Signal",
-                           color={'None':'gray','Low-pass':'b','High-pass':'g','Band-pass':'m','Smoothing':'r'}.get(self.filter_combo.currentText(), 'gray'))
-        if self.trace_idx in self.manual_picks_dict:
-            del self.manual_picks_dict[self.trace_idx]
 
     def save_fig(self):
         """
@@ -917,6 +1014,17 @@ class WaveformDialog(QDialog):
         fname, _ = QFileDialog.getSaveFileName(self, "Save Waveform Figure", "", "PNG Image (*.png)")
         if fname:
             self.fig.savefig(fname, dpi=900, bbox_inches='tight')
+
+    def clear_manual_picks(self):
+        """
+        Clear all manual picks for this trace and update the plot.
+        """
+        self.manual_picks = []
+        self.plot_waveform(self.filtered_trace,
+                           label=self.filter_combo.currentText() if self.filter_combo.currentText() != "None" else "Raw Signal",
+                           color={'None':'gray','Low-pass':'b','High-pass':'b','Band-pass':'b','Smoothing':'b'}.get(self.filter_combo.currentText(), 'gray'))
+        if self.trace_idx in self.manual_picks_dict:
+            del self.manual_picks_dict[self.trace_idx]
 
     def handle_export_manual_picks(self):
         """
@@ -960,16 +1068,16 @@ class WaveformDialog(QDialog):
         )
         dlg.exec_()
 
-    def handle_reflection_coeff(self):
-        """
-        Show the Reflection Coefficient dialog for current manual picks.
-        """
-        if self.trace_idx not in self.manual_picks_dict or not self.manual_picks_dict[self.trace_idx]:
-            QMessageBox.information(self, "No Picks", "No manual picks to analyze for this trace.")
-            return
-        picks = self.manual_picks_dict[self.trace_idx]
-        dlg = ReflectionCoeffDialog(self.trace, self.sample_depths, picks, parent=self)
-        dlg.exec_()
+    # def handle_reflection_coeff(self):
+    #     """
+    #     Show the Reflection Coefficient dialog for current manual picks.
+    #     """
+    #     if self.trace_idx not in self.manual_picks_dict or not self.manual_picks_dict[self.trace_idx]:
+    #         QMessageBox.information(self, "No Picks", "No manual picks to analyze for this trace.")
+    #         return
+    #     picks = self.manual_picks_dict[self.trace_idx]
+    #     dlg = ReflectionCoeffDialog(self.trace, self.sample_depths, picks, parent=self)
+    #     dlg.exec_()
 
 # --------------------------- MAIN GUI APPLICATION ---------------------------
 class ModernHorizonPickerGUI(QMainWindow):
@@ -1003,24 +1111,27 @@ class ModernHorizonPickerGUI(QMainWindow):
         controls_layout.addWidget(self.btn_load)
         controls_layout.addWidget(QLabel("Envelope Threshold Ratio"))
         self.thresh_spin = QDoubleSpinBox()
-        self.thresh_spin.setRange(0.01, 1.0)
+        self.thresh_spin.setRange(0.0, 0.99)  # 0.0 = all, 0.99 = only top 1% amplitudes
         self.thresh_spin.setSingleStep(0.01)
-        self.thresh_spin.setValue(1)
+        self.thresh_spin.setDecimals(2)
+        self.thresh_spin.setValue(0.5)  # default to 50th percentile (adjust as needed)
+        self.thresh_spin.setToolTip(
+            "Percentile threshold for envelope picking (0.0 = no threshold, 0.99 = only very strong reflectors).")
         controls_layout.addWidget(self.thresh_spin)
         controls_layout.addWidget(QLabel("Smoothing Sigma"))
         self.sigma_spin = QDoubleSpinBox()
-        self.sigma_spin.setRange(0.1, 20.0)
+        self.sigma_spin.setRange(0.1, 40.0)
         self.sigma_spin.setSingleStep(0.1)
         self.sigma_spin.setValue(8)
         controls_layout.addWidget(self.sigma_spin)
         controls_layout.addWidget(QLabel("Min Distance"))
         self.mindist_spin = QSpinBox()
-        self.mindist_spin.setRange(1, 50)
+        self.mindist_spin.setRange(1, 150)
         self.mindist_spin.setValue(10)
         controls_layout.addWidget(self.mindist_spin)
         controls_layout.addWidget(QLabel("Max Horizons/Trace"))
         self.maxh_spin = QSpinBox()
-        self.maxh_spin.setRange(1, 10)
+        self.maxh_spin.setRange(0, 15)
         self.maxh_spin.setValue(2)
         controls_layout.addWidget(self.maxh_spin)
         controls_layout.addWidget(QLabel("Ignore Top Samples"))
@@ -1036,7 +1147,7 @@ class ModernHorizonPickerGUI(QMainWindow):
         controls_layout.addWidget(self.min_sample_spin)
         controls_layout.addWidget(QLabel("Max Sample Index"))
         self.max_sample_spin = QSpinBox()
-        self.max_sample_spin.setRange(1, 10000)
+        self.max_sample_spin.setRange(1, 50000)
         self.max_sample_spin.setValue(500)
         controls_layout.addWidget(self.max_sample_spin)
         self.btn_pick = QPushButton("Pick Horizons")
@@ -1051,7 +1162,7 @@ class ModernHorizonPickerGUI(QMainWindow):
         self.btn_show_dip_az.clicked.connect(self.show_dip_azimuth_dialog)
         controls_layout.addWidget(self.btn_show_dip_az)
         self.btn_waveform = QPushButton("Show Waveform")
-        self.btn_waveform.clicked.connect(self.show_waveform_dialog)  
+        self.btn_waveform.clicked.connect(self.show_waveform_dialog)
         controls_layout.addWidget(self.btn_waveform)
         self.btn_export_auto_xlsx = QPushButton("Export Automatic Picks to .xlsx")
         self.btn_export_auto_xlsx.clicked.connect(self.export_automatic_picks_to_xlsx)
@@ -1063,6 +1174,7 @@ class ModernHorizonPickerGUI(QMainWindow):
         self.canvas = FigureCanvas(self.fig)
         panel_layout.addWidget(self.canvas)
         self.save_main_btn = QPushButton("Save Displayed Graphs (PNG, 900 DPI)")
+        self.save_main_btn.clicked.connect(self.save_fig)
         panel_layout.addWidget(self.save_main_btn)
         main_layout.addWidget(controls_widget)
         main_layout.addWidget(main_panel)
@@ -1095,8 +1207,92 @@ class ModernHorizonPickerGUI(QMainWindow):
                 self.max_sample_spin.setMaximum(num_samples - 1)
                 self.max_sample_spin.setValue(num_samples - 1)
                 self.manual_picks_dict = {}
+                # Save images without horizons
+                self.save_panel_images_without_horizons()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load SEG-Y file:\n{e}")
+
+    def save_panel_images_without_horizons(self):
+        """
+        Save images of SBP Profile, Cosine Phase, and Envelope (Haralick) without horizon overlays.
+        Call this after loading a SEG-Y, before picking.
+        """
+        import matplotlib.pyplot as plt
+
+        if self.seismic_data is None or self.sample_depths is None:
+            return
+
+        # 1. RAW SBP Profile
+        fig1, ax1 = plt.subplots(figsize=(10, 6))
+        ax1.imshow(self.seismic_data.T, cmap='gray', aspect='auto')
+        ax1.set_title('Raw SBP Profile')
+        ax1.set_ylabel('Sample Index (or TWT)')
+        ax1.set_xlabel('Trace Index')
+        fig1.tight_layout()
+        fname1, _ = QFileDialog.getSaveFileName(self, "Save RAW SBP Profile", "", "PNG Image (*.png)")
+        if fname1:
+            fig1.savefig(fname1, dpi=900, bbox_inches='tight')
+        plt.close(fig1)
+
+        # 2. Cosine Phase Image (no horizons)
+        # Compute phase if not done yet
+        if self.seismic_data is not None:
+            analytic_signal = hilbert(self.seismic_data, axis=1)
+            phase = np.angle(analytic_signal)
+            cos_phase_img = np.cos(phase)
+            depth_min = twt_to_depth(self.sample_depths[0])
+            depth_max = twt_to_depth(self.sample_depths[-1])
+            fig2, ax2 = plt.subplots(figsize=(10, 6))
+            img2 = ax2.imshow(
+                cos_phase_img.T,
+                cmap='gray',
+                aspect='auto',
+                extent=[0, self.seismic_data.shape[0], depth_max, depth_min]
+            )
+            num_ticks = 8
+            sample_indices = np.linspace(0, len(self.sample_depths) - 1, num_ticks, dtype=int)
+            depth_labels = [f"{twt_to_depth(self.sample_depths[i]):.1f}" for i in sample_indices]
+            depth_tickvals = [twt_to_depth(self.sample_depths[i]) for i in sample_indices]
+            ax2.set_yticks(depth_tickvals)
+            ax2.set_yticklabels(depth_labels)
+            ax2.set_ylabel('Depth (m)')
+            ax2.set_xlabel('Trace Index')
+            ax2.set_title('Cosine Phase Image')
+            fig2.tight_layout()
+            fname2, _ = QFileDialog.getSaveFileName(self, "Save Cosine Phase Image", "", "PNG Image (*.png)")
+            if fname2:
+                fig2.savefig(fname2, dpi=900, bbox_inches='tight')
+            plt.close(fig2)
+
+        # 3. Envelope Image (Haralick Transform, no horizons)
+        analytic_signal = hilbert(self.seismic_data, axis=1)
+        envelope = np.abs(analytic_signal)
+        envelope_smoothed = gaussian_filter(envelope, sigma=8)
+        gray_env = envelope_to_grayscale(envelope_smoothed)
+        depth_min = twt_to_depth(self.sample_depths[0])
+        depth_max = twt_to_depth(self.sample_depths[-1])
+        fig3, ax3 = plt.subplots(figsize=(10, 6))
+        ax3.imshow(
+            gray_env.T,
+            cmap='gray',
+            aspect='auto',
+            extent=[0, self.seismic_data.shape[0], depth_max, depth_min]
+        )
+        ax3.set_xlabel('Trace index')
+        ax3.set_ylabel('Depth (m)')
+        ax3.set_title('Envelope Image (Haralick Transform)')
+        num_ticks = 8
+        sample_indices = np.linspace(0, len(self.sample_depths) - 1, num_ticks, dtype=int)
+        depth_labels = [f"{twt_to_depth(self.sample_depths[i]):.1f}" for i in sample_indices]
+        depth_tickvals = [twt_to_depth(self.sample_depths[i]) for i in sample_indices]
+        ax3.set_yticks(depth_tickvals)
+        ax3.set_yticklabels(depth_labels)
+        fig3.tight_layout()
+        fname3, _ = QFileDialog.getSaveFileName(self, "Save Envelope Image (Haralick Transform)", "",
+                                                "PNG Image (*.png)")
+        if fname3:
+            fig3.savefig(fname3, dpi=900, bbox_inches='tight')
+        plt.close(fig3)
 
     def pick_and_plot(self):
         if self.seismic_data is None:
@@ -1118,6 +1314,14 @@ class ModernHorizonPickerGUI(QMainWindow):
         self.worker.error.connect(self._on_worker_error)
         self.worker.start()
 
+    def save_fig(self):
+        """
+        Export the current waveform plot as a PNG image.
+        """
+        fname, _ = QFileDialog.getSaveFileName(self, "Save Waveform Figure", "", "PNG Image (*.png)")
+        if fname:
+            self.fig.savefig(fname, dpi=900, bbox_inches='tight')
+
     def _on_worker_result(self, result):
         self.btn_pick.setEnabled(True)
         self.progress.setValue(100)
@@ -1138,9 +1342,8 @@ class ModernHorizonPickerGUI(QMainWindow):
         self.axs[0].clear()
         if self.seismic_data is not None:
             self.axs[0].imshow(self.seismic_data.T, cmap='gray', aspect='auto')
-            self.axs[0].set_title('Raw SBP Profile')
-            self.axs[0].set_ylabel('Sample Index (or TWT)')
-
+            self.axs[0].set_title('Raw SBP Image')
+            self.axs[0].set_ylabel('Sample Index (or T-W-T)')
         self.axs[1].clear()
         if self.phase is not None:
             # Show cosine phase using extent to align depth axis
@@ -1165,19 +1368,19 @@ class ModernHorizonPickerGUI(QMainWindow):
                 self.axs[1].set_ylabel('Sample Index')
             # Plot horizons in depth space
             if self.horizons:
-                colors = ['r', 'g', 'b', 'm', 'c']
+                colors = ['blue', 'aqua', 'orange', 'lawngreen', 'deeppink']
                 for idx, horizon in enumerate(self.horizons):
                     pick_i = [i for i, s in enumerate(horizon) if s is not None]
                     pick_j = [s for s in horizon if s is not None]
                     pick_depth = [twt_to_depth(self.sample_depths[s]) for s in pick_j]
                     color = colors[idx % len(colors)]
-                    self.axs[1].plot(pick_i, pick_depth, '.', markersize=2, color=color, label=f"Horizon {idx + 1}")
+                    self.axs[1].plot(pick_i, pick_depth, '.', markersize=1, color=color, label=f"Horizon {idx + 1}")
                 self.axs[1].legend(fontsize=6)
             self.axs[1].set_xlabel('Trace Index')
-            self.axs[1].set_title('Cosine Phase Image with Horizons')
+            self.axs[1].set_title('Cosine Phase Image')
         else:
             self.axs[1].set_title('Cosine Phase Image')
-            self.axs[1].set_ylabel('Sample Index (or TWT)')
+            self.axs[1].set_ylabel('Sample Index (or T-W-T)')
 
         self.axs[2].clear()
         if self.envelope_smoothed is not None:
@@ -1201,26 +1404,29 @@ class ModernHorizonPickerGUI(QMainWindow):
             else:
                 self.axs[2].set_ylabel('Sample Index')
             if self.horizons:
-                colors = ['r', 'g', 'b', 'm', 'c']
+                colors = ['blue', 'aqua', 'orange', 'lawngreen', 'deeppink']
                 for idx, horizon in enumerate(self.horizons):
                     pick_i = [i for i, s in enumerate(horizon) if s is not None]
                     pick_j = [s for s in horizon if s is not None]
                     pick_depth = [twt_to_depth(self.sample_depths[s]) for s in pick_j]
                     color = colors[idx % len(colors)]
-                    self.axs[2].plot(pick_i, pick_depth, '.', markersize=2, color=color, label=f"Horizon {idx + 1}")
+                    self.axs[2].plot(pick_i, pick_depth, '.', markersize=1, color=color, label=f"Horizon {idx + 1}")
                 self.axs[2].legend(fontsize=6)
             self.axs[2].set_xlabel('Trace index')
-            self.axs[2].set_title('Envelope Image (Haralick Transform)')
+            self.axs[2].set_title('Envelope Image (after Haralick Transform)')
         else:
-            self.axs[2].set_title('Envelope Image (Haralick Transform)')
+            self.axs[2].set_title('Envelope Image (after Haralick Transform)')
             self.axs[2].set_xlabel('Trace index')
-            self.axs[2].set_ylabel('Sample Index (or TWT)')
+            self.axs[2].set_ylabel('Sample Index (or T-W-T)')
         self.fig.tight_layout()
         self.canvas.draw()
 
     def show_waveform_dialog(self):
+        print("==> [GUI] Entered show_waveform_dialog")
+
         if self.seismic_data is None or self.sample_depths is None:
             QMessageBox.warning(self, "No Data", "Please load a SEG-Y file first.")
+            print("==> [GUI] Data missing.")
             return
         num_traces = self.seismic_data.shape[0]
         # Prompt the user to select the trace index within valid range
@@ -1233,9 +1439,13 @@ class ModernHorizonPickerGUI(QMainWindow):
             max=num_traces - 1
         )
         if not ok:
+            print("==> [GUI] Trace selection cancelled.")
             return
         trace = self.seismic_data[trace_idx]
+        print(f"==> [GUI] Trace shape: {trace.shape}")
         max_sample_index = self.seismic_data.shape[1] - 1
+
+        print("==> [GUI] Constructing WaveformDialog...")
         dlg = WaveformDialog(
             trace,
             self.sample_depths,
@@ -1244,7 +1454,9 @@ class ModernHorizonPickerGUI(QMainWindow):
             manual_picks_dict=self.manual_picks_dict,
             max_sample_index=max_sample_index
         )
+        print("==> [GUI] WaveformDialog constructed. Calling exec_()...")
         dlg.exec_()
+        print("==> [GUI] Dialog closed.")
 
     def show_dip_azimuth_dialog(self):
         if not (self.horizons and self.local_orientations):
@@ -1275,7 +1487,7 @@ class ModernHorizonPickerGUI(QMainWindow):
         QMessageBox.information(self, "Export Complete", f"Automatic picks exported to {fname}")
 
     def on_seed_click(self, event):
-        pass  
+        pass
 
 # ---------------------------- MAIN ENTRY POINT ------------------------------
 def main():
